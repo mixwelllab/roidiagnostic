@@ -1,0 +1,208 @@
+import os
+import asyncio
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+
+from aiogram import Bot, Dispatcher
+from aiogram.types import Message
+from aiogram.filters import CommandStart, Command
+from openai import OpenAI
+
+
+# =========================
+# ENV
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN not set")
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY not set")
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+# =========================
+# SYSTEM PROMPT
+# =========================
+SYSTEM_PROMPT = """
+Ты — аналитик диагностики зон потерь.
+
+Цель:
+— связать выбранную зону карты потерь с реальным бизнесом
+— проверить применимость зоны
+— построить микро-процесс 1–5
+— выявить узкое место (правило / фиксация / контроль)
+— сформировать диагностическое заключение
+
+Важно:
+— Пользователь может дать слабые или неполные ответы.
+— Если данных не хватает — строй гипотезы и явно помечай их как гипотезы.
+— Не выдумывай конкретные цифры.
+— Не проектируй решения.
+— Формулируй системно.
+
+Формат ответа строго:
+
+Зона: …
+Ниша: …
+
+ROI-зона (как теряются деньги): …
+
+Применимость: (вероятно / сомнительно / не применима) + причины
+
+Микро-процесс:
+1️⃣ Точка возникновения: …
+2️⃣ Действие человека: …
+3️⃣ Отсутствующее правило/критерий: …
+4️⃣ Где должна быть фиксация/контроль: …
+5️⃣ Финансовый эффект: …
+
+Вероятный разрыв: …
+
+Гипотезы (если есть): 
+— …
+
+Что нужно уточнить: 
+— …
+
+Уверенность: низкая / средняя / высокая + почему
+"""
+
+
+# =========================
+# QUESTIONS
+# =========================
+QUESTIONS = [
+    "1️⃣ Ниша / тип бизнеса\n\nНапример: автосервис, клиника, производство, логистика, розница.",
+    
+    "2️⃣ Название зоны\n\nВведи строку из карты потерь (как она у тебя называется).",
+    
+    "3️⃣ Максимальное описание бизнеса\n\nОпиши, как сейчас работает бизнес и как проявляется эта зона.\nМожно большим текстом.",
+    
+    "4️⃣ Где именно возникает проблема?\n\nНазови конкретный момент процесса.\nПримеры:\n• когда клиент звонит\n• когда оформляют заказ\n• когда выставляют счёт\n• когда выдают товар\n• когда делают обслуживание\n• когда принимают поставку\n• когда формируют отчёт",
+    
+    "5️⃣ Что делает человек или система в этот момент?\n\nСформулируй так:\n“Когда происходит X, сотрудник делает Y”\n\nПримеры:\n• не перезванивает\n• даёт скидку без согласования\n• не проверяет гарантию\n• не фиксирует брак",
+    
+    "6️⃣ Какого правила или критерия не хватает?\n\nПравило — это условие:\n“Если X, то делаем Y”\n\nПримеры:\n• нет допустимого % скидки\n• нет срока реакции\n• нет порога отклонения\n• нет обязательного шага проверки",
+    
+    "7️⃣ Где должна быть фиксация или контроль?\n\nГде должна оставаться запись или сигнал?\nПримеры:\n• CRM\n• 1С\n• отчёт\n• журнал\n• таблица\n• лог\n• чек-лист\n• метрика",
+    
+    "8️⃣ Как именно из-за этого теряются деньги?\n\nНе “клиенты недовольны”, а:\n• теряется выручка\n• падает маржа\n• растёт себестоимость\n• происходят переплаты\n• увеличиваются списания\n\nЕсли сложно — подумай:\nЕсли это будет продолжаться год — где бизнес потеряет деньги?"
+]
+
+
+# =========================
+# STATE (in-memory)
+# =========================
+@dataclass
+class Session:
+    step: int = 0
+    answers: Dict[int, str] = field(default_factory=dict)
+
+SESSIONS: Dict[int, Session] = {}
+
+
+def get_session(user_id: int) -> Session:
+    if user_id not in SESSIONS:
+        SESSIONS[user_id] = Session()
+    return SESSIONS[user_id]
+
+
+def build_payload(session: Session) -> str:
+    return f"""
+Ниша: {session.answers.get(0, '')}
+Зона: {session.answers.get(1, '')}
+Описание бизнеса: {session.answers.get(2, '')}
+
+Дополнительные данные:
+1️⃣ Точка возникновения: {session.answers.get(3, '')}
+2️⃣ Действие: {session.answers.get(4, '')}
+3️⃣ Отсутствующее правило: {session.answers.get(5, '')}
+4️⃣ Фиксация/контроль: {session.answers.get(6, '')}
+5️⃣ Финансовый эффект: {session.answers.get(7, '')}
+"""
+
+
+async def generate_report(session: Session) -> str:
+    user_input = build_payload(session)
+
+    def call_llm():
+        response = client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_input},
+            ],
+            temperature=0.2,
+        )
+        return response.output_text
+
+    return await asyncio.to_thread(call_llm)
+
+
+# =========================
+# HANDLERS
+# =========================
+@dp.message(CommandStart())
+async def start(message: Message):
+    SESSIONS[message.from_user.id] = Session()
+    await message.answer(
+        "Диагностика зоны потерь.\n"
+        "Ответь на 8 вопросов по очереди.\n"
+        "После последнего ответа отчёт сформируется автоматически.\n\n"
+        "Можно начать заново командой /reset"
+    )
+    await message.answer(QUESTIONS[0])
+
+
+@dp.message(Command("reset"))
+async def reset(message: Message):
+    SESSIONS[message.from_user.id] = Session()
+    await message.answer("Сбросил. Начинаем заново.")
+    await message.answer(QUESTIONS[0])
+
+
+@dp.message()
+async def handle_message(message: Message):
+    session = get_session(message.from_user.id)
+
+    if session.step >= len(QUESTIONS):
+        await message.answer("Диагностика уже завершена. Напиши /reset чтобы начать заново.")
+        return
+
+    session.answers[session.step] = message.text
+    session.step += 1
+
+    if session.step < len(QUESTIONS):
+        await message.answer(QUESTIONS[session.step])
+    else:
+        await message.answer("Принял. Формирую диагностический отчёт…")
+        try:
+            report = await generate_report(session)
+        except Exception as e:
+            await message.answer(f"Ошибка при обращении к модели: {e}")
+            return
+
+        # Telegram safety split
+        MAX_LEN = 3800
+        if len(report) <= MAX_LEN:
+            await message.answer(report)
+        else:
+            for i in range(0, len(report), MAX_LEN):
+                await message.answer(report[i:i+MAX_LEN])
+
+
+# =========================
+# RUN
+# =========================
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
